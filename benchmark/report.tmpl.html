@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Postgres vs ClickHouse</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#fff; --fg:#1b1f24; --muted:#656d76; --line:#d8dee4; --pg:#336791; --ch:#e8a400; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8b949e; --line:#30363d; --pg:#6ea8d9; --ch:#f2c744; } }
+  body { margin:0; padding:24px 16px; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:960px; margin:0 auto; }
+  h1 { font-size:1.4rem; margin:0 0 4px; } h2 { font-size:1.05rem; margin:28px 0 8px; }
+  p.sub { color:var(--muted); margin:0 0 20px; }
+  .controls { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:12px; }
+  label { color:var(--muted); font-size:.85rem; display:flex; flex-direction:column; gap:2px; }
+  select { font:inherit; padding:4px 8px; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; }
+  .chart { position:relative; height:340px; }
+  table { border-collapse:collapse; width:100%; font-size:.85rem; margin-top:8px; }
+  th, td { text-align:right; padding:6px 8px; border-bottom:1px solid var(--line); } th:first-child, td:first-child { text-align:left; }
+  .note { color:var(--muted); font-size:.82rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Postgres vs ClickHouse</h1>
+  <p class="sub">Time-series queries on raw tables. Median of repeated runs after a warm-up; lower is faster.</p>
+
+  <div class="controls">
+    <label>Query <select id="query"></select></label>
+    <label>Dataset <select id="run"></select></label>
+    <label>Time range (scaling chart) <select id="window"></select></label>
+    <label>Metric <select id="metric">
+      <option value="median_ms">Wall clock (client)</option>
+      <option value="server_median_ms">Engine-reported</option></select></label>
+    <label>Scale <select id="scale"><option value="logarithmic">Log</option><option value="linear">Linear</option></select></label>
+  </div>
+
+  <h2>Query time by time range</h2>
+  <div class="chart"><canvas id="byWindow"></canvas></div>
+  <h2>Query time as the dataset grows</h2>
+  <div class="chart"><canvas id="byRows"></canvas></div>
+  <p class="note" id="rowsNote"></p>
+
+  <h2>Details</h2>
+  <table id="table"></table>
+</main>
+<script>
+const runs = (/*DATA*/[]).sort((a, b) => a.rows - b.rows);
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const COLORS = () => ({ postgres: css('--pg'), clickhouse: css('--ch') });
+const ORDER = ['1h', '1d', '1w', 'all'];
+const fmtRows = n => n >= 1e6 ? (n / 1e6).toFixed(n % 1e6 ? 2 : 0) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n);
+
+const titles = Object.assign({}, ...runs.map(r => r.titles));
+$('query').innerHTML = Object.entries(titles).map(([id, t]) => `<option value="${id}">${t}</option>`).join('');
+$('run').innerHTML = runs.map((r, i) => `<option value="${i}">${r.label} (${fmtRows(r.rows)} rows)</option>`).join('');
+$('run').value = runs.length - 1;
+const windows = [...new Set(runs.flatMap(r => r.results.map(x => x.window)))].sort((a, b) => ORDER.indexOf(a) - ORDER.indexOf(b));
+$('window').innerHTML = windows.map(w => `<option>${w}</option>`).join('');
+$('window').value = windows[windows.length - 1];
+
+const find = (run, q, w, e) => run.results.find(x => x.query === q && x.window === w && x.engine === e);
+const val = (r, m) => r ? (r[m] || null) : null;
+let c1, c2;
+
+function opts(yTitle, xTitle) {
+  const grid = css('--line'), fg = css('--muted');
+  return { responsive: true, maintainAspectRatio: false, spanGaps: true,
+    plugins: { legend: { labels: { color: fg } } },
+    scales: {
+      x: { title: { display: true, text: xTitle, color: fg }, ticks: { color: fg }, grid: { color: grid } },
+      y: { type: $('scale').value, title: { display: true, text: yTitle, color: fg }, ticks: { color: fg }, grid: { color: grid } } } };
+}
+
+function draw() {
+  const q = $('query').value, m = $('metric').value, w = $('window').value, run = runs[$('run').value], col = COLORS();
+  const yTitle = 'ms (' + (m === 'median_ms' ? 'wall clock' : 'engine-reported') + ')';
+  const ws = ORDER.filter(x => run.results.some(r => r.window === x));
+  c1 && c1.destroy(); c2 && c2.destroy();
+  c1 = new Chart($('byWindow'), { type: 'bar',
+    data: { labels: ws, datasets: ['postgres', 'clickhouse'].map(e => ({ label: e, backgroundColor: col[e], data: ws.map(x => val(find(run, q, x, e), m)) })) },
+    options: opts(yTitle, 'time range ending at newest row') });
+  c2 = new Chart($('byRows'), { type: 'line',
+    data: { labels: runs.map(r => fmtRows(r.rows)), datasets: ['postgres', 'clickhouse'].map(e => ({ label: e, borderColor: col[e], backgroundColor: col[e], tension: .2,
+      data: runs.map(r => val(find(r, q, w, e), m)) })) },
+    options: opts(yTitle, 'rows in table (time range: ' + w + ')') });
+  $('rowsNote').textContent = runs.length < 2 ? 'Only one dataset size so far. Run the benchmark again at other row counts (-label) to see scaling.' : '';
+
+  const rows = ws.map(x => [x, find(run, q, x, 'postgres'), find(run, q, x, 'clickhouse')]);
+  const f = r => r ? (r[m] ? r[m].toFixed(1) : 'n/a') : '';
+  $('table').innerHTML = '<tr><th>Range</th><th>Rows in range</th><th>Postgres ms</th><th>ClickHouse ms</th><th>Speed-up</th></tr>' +
+    rows.map(([x, p, c]) => `<tr><td>${x}</td><td>${p ? p.window_rows.toLocaleString() : ''}</td><td>${f(p)}</td><td>${f(c)}</td><td>${p && c && p[m] && c[m] ? (p[m] / c[m]).toFixed(1) + '×' : ''}</td></tr>`).join('');
+}
+['query', 'run', 'window', 'metric', 'scale'].forEach(id => $(id).addEventListener('change', draw));
+draw();
+</script>
+</body>
+</html>

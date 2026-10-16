@@ -1,0 +1,65 @@
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: postgres/Dockerfile
+    container_name: api-request-analyzer-postgres
+    cpus: ${DB_CPUS:-4}          # identical limits for both databases keep the benchmark fair
+    mem_limit: ${DB_MEMORY:-3g}
+    shm_size: 1gb   # default 64MB breaks parallel query / VACUUM on large tables
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-app_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=4
+      - -c
+      - max_replication_slots=4
+      # Defaults assume a tiny machine; size for the 3g limit (ClickHouse sizes itself automatically).
+      - -c
+      - shared_buffers=768MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - work_mem=64MB
+      - -c
+      - max_parallel_workers_per_gather=4
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.7
+    container_name: api-request-analyzer-clickhouse
+    cpus: ${DB_CPUS:-4}          # identical limits for both databases keep the benchmark fair
+    mem_limit: ${DB_MEMORY:-3g}
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-app_db}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"   # HTTP, used by Airbyte
+      - "9000:9000"   # native
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - chdata:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
+  chdata:
